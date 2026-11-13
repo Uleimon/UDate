@@ -1,0 +1,444 @@
+// UDate – Datenmodell
+//
+// Grundsätze:
+// - Personenbezogene und sensible Daten (Präferenzen, Persönlichkeit, Chats) liegen in eigenen Tabellen,
+//   damit Zugriff, Export und Löschung sauber getrennt sind.
+// - Löschen eines Users löscht alles, was an ihm hängt (onDelete: Cascade). Meldungen bleiben anonymisiert erhalten.
+// - Keine biometrischen Daten. Optische Merkmale sind nur selbst angegebene Stil-Tags.
+// - Standort nur gerundet (ca. 1 km), nie GPS-genau.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ================================================================ Konten & Sicherheit
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum AccountStatus {
+  PENDING_VERIFICATION // E-Mail noch nicht bestätigt
+  ACTIVE
+  DEACTIVATED // vom Nutzer pausiert, unsichtbar, jederzeit reaktivierbar
+  SUSPENDED // von Moderation gesperrt
+}
+
+model User {
+  id              String        @id @default(cuid())
+  email           String        @unique // immer klein geschrieben gespeichert
+  passwordHash    String // Argon2id
+  emailVerifiedAt DateTime?
+  status          AccountStatus @default(PENDING_VERIFICATION)
+  role            Role          @default(USER)
+  birthDate       DateTime      @db.Date // Pflicht bei Registrierung, Alter >= 18 wird serverseitig geprüft
+  ageVerifiedAt   DateTime? // gesetzt nach echter Altersverifizierung (Anbieter später, siehe ROADMAP)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  lastActiveAt    DateTime?
+  deactivatedAt   DateTime?
+
+  sessions          Session[]
+  tokens            AuthToken[]
+  consents          Consent[]
+  profile           Profile?
+  photos            Photo[]
+  onboarding        OnboardingState?
+  personality       PersonalityAnswer[]
+  compassRatings    CompassRating[]
+  visualPreferences VisualPreference[]
+  likesSent         Like[]              @relation("LikeFrom")
+  likesReceived     Like[]              @relation("LikeTo")
+  favorites         Favorite[]          @relation("FavoriteOwner")
+  favoritedBy       Favorite[]          @relation("FavoriteTarget")
+  blocksMade        Block[]             @relation("BlockFrom")
+  blocksReceived    Block[]             @relation("BlockTo")
+  matchesA          Match[]             @relation("MatchA")
+  matchesB          Match[]             @relation("MatchB")
+  messages          Message[]
+  reportsMade       Report[]            @relation("ReportFrom")
+  reportsReceived   Report[]            @relation("ReportAbout")
+  entitlements      Entitlement[]
+  adminActions      AdminAuditLog[]     @relation("AuditActor")
+
+  @@index([status])
+}
+
+/// Server-seitige Session. Das Cookie enthält nur ein zufälliges Token, in der DB liegt nur dessen Hash.
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  lastSeenAt DateTime @default(now())
+  userAgent  String?
+  ipHash     String? // gehasht, nicht im Klartext
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+  EMAIL_CHANGE
+}
+
+/// Einmal-Tokens für E-Mail-Links. Nur der Hash wird gespeichert.
+model AuthToken {
+  id        String        @id @default(cuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String        @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+}
+
+enum ConsentType {
+  TERMS // Nutzungsbedingungen
+  PRIVACY // Datenschutzerklärung
+  SENSITIVE_PREFERENCES // Verarbeitung optischer/persönlicher Präferenzen für das Matching (Art. 9 DSGVO-nah, ausdrücklich)
+  AI_PROCESSING // Senden von Profiltexten an einen KI-Anbieter (Coach, Gesprächseinstiege)
+  MARKETING
+}
+
+/// Einwilligungen mit Version und Zeitpunkt. Widerruf = neuer Eintrag mit granted=false (Historie bleibt nachweisbar).
+model Consent {
+  id        String      @id @default(cuid())
+  userId    String
+  type      ConsentType
+  version   String
+  granted   Boolean
+  createdAt DateTime    @default(now())
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type, createdAt])
+}
+
+// ================================================================ Profil
+
+enum Gender {
+  woman
+  man
+  nonbinary
+}
+
+enum Visibility {
+  PUBLIC // für alle vorgeschlagenen Profile sichtbar
+  MATCHES // nur nach einem Match
+  PRIVATE // nur für mich und das Matching
+}
+
+model Profile {
+  userId          String   @id
+  displayName     String
+  gender          Gender
+  genderSelfDesc  String? // freie Selbstbeschreibung, optional
+  seeking         Gender[]
+  ageMin          Int      @default(18)
+  ageMax          Int      @default(99)
+  city            String?
+  /// gerundet auf 2 Nachkommastellen (~1 km)
+  lat             Float?
+  lng             Float?
+  radiusKm        Int      @default(50)
+  bio             String?
+  heightCm        Int?
+
+  /// Beziehung & Lebensziele (Schlüssel aus @udate/shared catalog)
+  relationshipGoals String[]
+  childrenPlan      String?
+  livingPlan        String?
+  smoking           String?
+  drinking          String?
+  /// { careerFocus, travelWish, activityLevel } jeweils 0..1
+  lifestyle         Json     @default("{}")
+  /// { smoking: [...], drinking: [...], childrenPlan: [...], relationshipGoal: [...] }
+  dealbreakers      Json     @default("{}")
+  flexibleOn        String[]
+  interests         String[]
+  /// selbst angegebene Stil-Tags { hairColor: ["brown"], ... }
+  appearance        Json     @default("{}")
+  preferredHeightMin Int?
+  preferredHeightMax Int?
+
+  /// Gewichtung der Matching-Bereiche { visual, personality, relationship, lifestyle }
+  matchWeights      Json?
+  /// Was andere sehen dürfen: { childrenPlan: "MATCHES", heightCm: "PRIVATE", ... }
+  fieldVisibility   Json     @default("{}")
+  /// Likes-Benachrichtigungen an andere zeigen? Sichtbar im Entdecken?
+  discoverable      Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([gender])
+  @@index([lat, lng])
+}
+
+enum ModerationState {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// Profilbild. Datei liegt im Object Storage unter storageKey (privat, Auslieferung nur über signierte URLs).
+model Photo {
+  id         String          @id @default(cuid())
+  userId     String
+  storageKey String          @unique
+  position   Int
+  width      Int?
+  height     Int?
+  moderation ModerationState @default(PENDING)
+  createdAt  DateTime        @default(now())
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, position])
+}
+
+/// Fortschritt im Onboarding, damit man pausieren und später weitermachen kann.
+model OnboardingState {
+  userId      String    @id
+  currentStep Int       @default(1)
+  /// Zwischenstand der aktuellen Schritte (wird beim Abschluss in Profil/Antworten übernommen)
+  draft       Json      @default("{}")
+  completedAt DateTime?
+  updatedAt   DateTime  @updatedAt
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ================================================================ Persönlichkeit
+
+/// Antwort auf eine Frage aus dem Fragenkatalog (Fragen leben versioniert im Code, siehe ROADMAP Tag 7).
+/// Ausgewertete Eigenschaften werden daraus berechnet, nicht separat "geraten".
+model PersonalityAnswer {
+  id         String   @id @default(cuid())
+  userId     String
+  questionId String
+  /// Antwort je nach Fragetyp: { choice: "x" } | { scale: 0.7 } | { text: "..." }
+  answer     Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, questionId])
+}
+
+// ================================================================ Attraktivitäts-Kompass
+
+/// Beispielbild für das Training. Nur Bilder mit dokumentierter Lizenz und Einwilligung der abgebildeten erwachsenen Person.
+model CompassImage {
+  id           String   @id @default(cuid())
+  storageKey   String   @unique
+  /// Herkunft und Lizenz (Pflicht): z. B. "Shooting 2027-01, Model-Release #123"
+  license      String
+  modelRelease Boolean // Einwilligung der abgebildeten Person liegt vor
+  adultConfirmed Boolean // abgebildete Person nachweislich volljährig
+  /// redaktionell vergebene Stil-Tags, gleiche Schlüssel wie Profile.appearance
+  tags         Json
+  /// für welche Suche das Bild gezeigt wird
+  gender       Gender
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  ratings CompassRating[]
+}
+
+model CompassRating {
+  id        String       @id @default(cuid())
+  userId    String
+  imageId   String
+  rating    String // very_attractive | attractive | neutral | less_attractive | not_my_type
+  /// optionale Begründung, z. B. "Haare und Kleidungsstil"
+  note      String?
+  /// aus der Begründung abgeleitete Merkmale, die der Nutzer bestätigt hat { liked: ["hairColor"], disliked: [...] }
+  aspects   Json?
+  createdAt DateTime     @default(now())
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  image     CompassImage @relation(fields: [imageId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, imageId])
+}
+
+enum PreferenceSource {
+  learned
+  confirmed
+  manual
+}
+
+/// Eine Zeile pro Merkmal+Wert. Nutzer kann jede Zeile sehen, bestätigen, ändern, löschen.
+model VisualPreference {
+  userId    String
+  attribute String
+  value     String
+  weight    Float // -1 .. 1
+  evidence  Int              @default(0)
+  source    PreferenceSource
+  updatedAt DateTime         @updatedAt
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, attribute, value])
+}
+
+// ================================================================ Likes, Matches, Chat
+
+enum LikeKind {
+  LIKE
+  PASS // "Dislike": wird nie angezeigt, nur damit das Profil nicht wieder kommt
+}
+
+model Like {
+  fromId    String
+  toId      String
+  kind      LikeKind
+  createdAt DateTime @default(now())
+  from      User     @relation("LikeFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  to        User     @relation("LikeTo", fields: [toId], references: [id], onDelete: Cascade)
+
+  @@id([fromId, toId])
+  @@index([toId, kind])
+}
+
+model Favorite {
+  ownerId   String
+  targetId  String
+  createdAt DateTime @default(now())
+  owner     User     @relation("FavoriteOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  target    User     @relation("FavoriteTarget", fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@id([ownerId, targetId])
+}
+
+model Block {
+  fromId    String
+  toId      String
+  createdAt DateTime @default(now())
+  from      User     @relation("BlockFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  to        User     @relation("BlockTo", fields: [toId], references: [id], onDelete: Cascade)
+
+  @@id([fromId, toId])
+  @@index([toId])
+}
+
+/// Gegenseitiges Match. userAId < userBId (sortiert), damit ein Paar nur einmal existiert.
+model Match {
+  id           String    @id @default(cuid())
+  userAId      String
+  userBId      String
+  /// gegenseitiger Wert zum Zeitpunkt des Matches (0..100), nur zur Anzeige
+  compatibility Int?
+  createdAt    DateTime  @default(now())
+  endedAt      DateTime?
+  endedById    String?
+  userA        User      @relation("MatchA", fields: [userAId], references: [id], onDelete: Cascade)
+  userB        User      @relation("MatchB", fields: [userBId], references: [id], onDelete: Cascade)
+  messages     Message[]
+
+  @@unique([userAId, userBId])
+  @@index([userBId])
+}
+
+enum MessageKind {
+  TEXT
+  IMAGE
+}
+
+model Message {
+  id         String          @id @default(cuid())
+  matchId    String
+  senderId   String
+  kind       MessageKind     @default(TEXT)
+  body       String? // Text
+  imageKey   String? // Bild im Object Storage, erst nach Prüfung sichtbar
+  moderation ModerationState @default(APPROVED)
+  createdAt  DateTime        @default(now())
+  deliveredAt DateTime?
+  readAt     DateTime?
+  match      Match           @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  sender     User            @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([matchId, createdAt])
+}
+
+// ================================================================ Moderation & Verwaltung
+
+enum ReportReason {
+  FAKE_PROFILE
+  HARASSMENT
+  SPAM
+  INAPPROPRIATE_CONTENT
+  UNDERAGE
+  SCAM
+  OTHER
+}
+
+enum ReportStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  DISMISSED
+}
+
+/// Meldungen bleiben nach Löschung eines Kontos erhalten (Ids werden auf null gesetzt), damit Moderation nachvollziehbar bleibt.
+model Report {
+  id         String       @id @default(cuid())
+  reporterId String?
+  reportedId String?
+  reason     ReportReason
+  details    String?
+  status     ReportStatus @default(OPEN)
+  resolution String?
+  createdAt  DateTime     @default(now())
+  resolvedAt DateTime?
+  reporter   User?        @relation("ReportFrom", fields: [reporterId], references: [id], onDelete: SetNull)
+  reported   User?        @relation("ReportAbout", fields: [reportedId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+}
+
+/// Jeder Admin-Zugriff auf geschützte Daten (Chats, Präferenzen) und jede Sperre wird hier protokolliert. Nur anhängen, nie ändern.
+model AdminAuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String // z. B. "user.suspend", "report.view_chat"
+  targetType String
+  targetId   String
+  /// Pflicht-Begründung bei Zugriff auf geschützte Daten
+  reason     String?
+  meta       Json?
+  createdAt  DateTime @default(now())
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
+// ================================================================ Premium (nur vorbereitet, keine Zahlungen)
+
+/// Freigeschaltete Zusatzfunktionen. Ohne Eintrag gilt der kostenlose Umfang. Zahlungsanbindung kommt erst nach rechtlicher Klärung.
+model Entitlement {
+  id        String    @id @default(cuid())
+  userId    String
+  feature   String // z. B. "advanced_filters", "extended_explanations"
+  source    String // "dev", "promo", später "store"
+  validFrom DateTime  @default(now())
+  validTo   DateTime?
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, feature])
+}

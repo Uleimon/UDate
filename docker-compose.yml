@@ -1,0 +1,12 @@
+# Nur für die lokale Entwicklung. Produktion: verwaltete Datenbank + Object Storage.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: udate
+      POSTGRES_PASSWORD: udate_dev
+      POSTGRES_DB: udate
+    ports: ["5432:5432"]
+    volumes: [udate-db:/var/lib/postgresql/data]
+volumes:
+  udate-db:

@@ -1,0 +1,85 @@
+name: Android APK
+
+# Baut die Android-App (apps/mobile) als installierbare APK.
+# Läuft bei jedem Push auf main, der die App oder geteilte Pakete betrifft, und auf Knopfdruck (Actions → Run workflow).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/mobile/**'
+      - 'packages/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/android-apk.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Abhängigkeiten installieren
+        run: pnpm install --frozen-lockfile
+
+      - name: Geteilte Pakete bauen
+        run: pnpm --filter @udate/shared build
+
+      - name: Typprüfung App
+        run: pnpm --filter @udate/mobile typecheck
+
+      - name: Android-Projekt erzeugen (expo prebuild)
+        working-directory: apps/mobile
+        env:
+          CI: '1'
+        run: npx expo prebuild --platform android --no-install
+
+      - name: APK bauen
+        working-directory: apps/mobile/android
+        run: ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --no-daemon
+
+      - name: APK benennen
+        id: apk
+        run: |
+          VERSION=$(node -p "require('./apps/mobile/app.json').expo.version")
+          mkdir -p out
+          cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk "out/UDate-${VERSION}.apk"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UDate-${{ steps.apk.outputs.version }}-apk
+          path: out/*.apk
+          retention-days: 30
+
+      - name: Als Release zum Herunterladen veröffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="android-v${{ steps.apk.outputs.version }}"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" out/*.apk --prerelease --target "${{ github.sha }}" \
+            --title "UDate ${{ steps.apk.outputs.version }} (Android-Testversion)" \
+            --notes "Testversion zum Ausprobieren. Auf dem Handy die APK herunterladen und installieren (Installation aus unbekannten Quellen erlauben). Signiert mit einem Entwicklungs-Schlüssel, nicht für den Play Store."
